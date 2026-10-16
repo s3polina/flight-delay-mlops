@@ -30,4 +30,14 @@ web = [
     "fastapi>=0.141.1",
     "sqlalchemy>=2.0.54",
     "uvicorn[standard]>=0.53.0",
+    # inference: загрузка модели из MLflow (без сервера и UI)
+    "mlflow-skinny>=3.10,<4",
+    "pandas>=2.2",
+    "scikit-learn>=1.6",
+]
+# EDA, обучение и регистрация моделей (скрипты из папки ml/)
+ml = [
+    "mlflow>=3.10,<4",
+    "matplotlib>=3.9",
+    "nycflights13>=0.0.3",
 ]

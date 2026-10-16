@@ -4,13 +4,18 @@ services:
       context: .
     environment:
       DATABASE_URL: postgresql://postgres:postgres@db:5432/flight_delay
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MODEL_NAME: flight-delay-classifier
+      MODEL_ALIAS: champion
     ports:
       - "8000:8000"
     depends_on:
       db:
         condition: service_healthy
+      mlflow:
+        condition: service_healthy
     restart: unless-stopped
-    mem_limit: 512m
+    mem_limit: 1g
     cpus: 1.0
     logging:
       driver: json-file
@@ -42,5 +47,61 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  # ---------- MLflow ----------
+
+  # Backend Store: эксперименты, runs, параметры, метрики, датасеты, Model Registry
+  mlflow-db:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: mlflow
+      POSTGRES_USER: mlflow
+      POSTGRES_PASSWORD: mlflow
+    volumes:
+      - mlflow_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mlflow -d mlflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Tracking Server + UI. Клиенты общаются только с ним (http://localhost:5000).
+  # Backend Store  - PostgreSQL mlflow-db (метаданные),
+  # Artifact Store - отдельный том mlflow_artifacts, смонтированный в /mlartifacts (файлы).
+  # Сервер сам принимает и отдаёт артефакты (--serve-artifacts).
+  mlflow:
+    build:
+      context: ./mlflow-server
+    command: >
+      mlflow server
+      --host 0.0.0.0
+      --port 5000
+      --backend-store-uri postgresql://mlflow:mlflow@mlflow-db:5432/mlflow
+      --artifacts-destination /mlartifacts
+      --serve-artifacts
+      --allowed-hosts "localhost,localhost:*,127.0.0.1:*,mlflow,mlflow:*"
+    volumes:
+      - mlflow_artifacts:/mlartifacts
+    ports:
+      - "5000:5000"
+    depends_on:
+      mlflow-db:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+
 volumes:
   postgres_data:
+  mlflow_db_data:
+  mlflow_artifacts:
