@@ -1,4 +1,5 @@
-from datetime import date
+from datetime import date, datetime
+from uuid import UUID
 
 from pydantic import BaseModel, Field
 
@@ -15,22 +16,23 @@ class Flight(BaseModel):
     distance: float = Field(gt=0, description="мили", examples=[746])
 
 
-class ProcessRequest(BaseModel):
-    flights: list[Flight] = Field(min_length=1, max_length=1000)
+class TaskMessage(BaseModel):
+    task_id: UUID
+    source: str
+    created_at: datetime
+    flight: Flight
 
 
-class Prediction(BaseModel):
-    delay_probability: float
-    is_delayed: bool
+class TaskAccepted(BaseModel):
+    task_id: UUID
+    status: str
 
 
-class ModelInfo(BaseModel):
-    name: str
-    alias: str
-    version: str
-    run_id: str
-
-
-class ProcessResponse(BaseModel):
-    model: ModelInfo
-    predictions: list[Prediction]
+class TaskStatus(BaseModel):
+    task_id: UUID
+    status: str
+    delay_probability: float | None = None
+    is_delayed: bool | None = None
+    model_version: str | None = None
+    created_at: datetime
+    finished_at: datetime | None = None

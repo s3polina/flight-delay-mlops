@@ -1,27 +1,101 @@
+x-pipeline-env: &pipeline-env
+  RABBIT_URL: amqp://guest:guest@rabbitmq:5672/
+  DATABASE_URL: postgresql://postgres:postgres@db:5432/flight_delay
+  TASKS_QUEUE: ${TASKS_QUEUE:-flight.tasks}
+  QUEUE_MAX_LENGTH: ${QUEUE_MAX_LENGTH:-100}
+  DELIVERY_LIMIT: ${DELIVERY_LIMIT:-3}
+  INFERENCE_DELAY_SEC: ${INFERENCE_DELAY_SEC:-0.2}
+  WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-4}
+  PREFETCH_COUNT: ${PREFETCH_COUNT:-4}
+  RUN_LABEL: ${RUN_LABEL:-manual}
+  METRICS_DIR: /app/experiments/results
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   app:
     build:
       context: .
     environment:
-      DATABASE_URL: postgresql://postgres:postgres@db:5432/flight_delay
-      MLFLOW_TRACKING_URI: http://mlflow:5000
-      MODEL_NAME: flight-delay-classifier
-      MODEL_ALIAS: champion
+      <<: *pipeline-env
     ports:
       - "8000:8000"
     depends_on:
       db:
         condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+    mem_limit: 512m
+    cpus: 1.0
+    logging: *default-logging
+
+  worker:
+    build:
+      context: .
+    command:
+      [
+        "uv", "run", "--no-sync", "uvicorn", "flight_delay_mlops.worker:app",
+        "--host", "0.0.0.0", "--port", "8001",
+        "--timeout-graceful-shutdown", "40",
+      ]
+    environment:
+      <<: *pipeline-env
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MODEL_NAME: flight-delay-classifier
+      MODEL_ALIAS: champion
+      GRACEFUL_TIMEOUT_SEC: "30"
+    ports:
+      - "8001-8002:8001"
+    volumes:
+      - ./experiments/results:/app/experiments/results
+    depends_on:
+      db:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
       mlflow:
         condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD", "python", "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    stop_grace_period: 45s
     restart: unless-stopped
     mem_limit: 1g
     cpus: 1.0
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+    logging: *default-logging
+
+  source:
+    build:
+      context: .
+    command: ["uv", "run", "--no-sync", "python", "-m", "flight_delay_mlops.source"]
+    environment:
+      <<: *pipeline-env
+      SOURCE_DATA_PATH: /app/data/flights_2013.csv
+      SOURCE_MAX_TASKS: ${SOURCE_MAX_TASKS:-0}
+      SOURCE_DURATION_SEC: ${SOURCE_DURATION_SEC:-0}
+    volumes:
+      - ./data:/app/data:ro
+      - ./experiments/results:/app/experiments/results
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    profiles: ["load"]
+    restart: "no"
+    mem_limit: 512m
+    cpus: 1.0
+    logging: *default-logging
 
   db:
     image: postgres:17
@@ -30,7 +104,7 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -41,11 +115,24 @@ services:
     restart: unless-stopped
     mem_limit: 512m
     cpus: 1.0
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+    logging: *default-logging
+
+  rabbitmq:
+    image: rabbitmq:4-management
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+    mem_limit: 1g
+    logging: *default-logging
 
   # ---------- MLflow ----------
 
@@ -83,7 +170,7 @@ services:
     volumes:
       - mlflow_artifacts:/mlartifacts
     ports:
-      - "5000:5000"
+      - "5001:5000"
     depends_on:
       mlflow-db:
         condition: service_healthy
@@ -105,3 +192,4 @@ volumes:
   postgres_data:
   mlflow_db_data:
   mlflow_artifacts:
+  rabbitmq_data:

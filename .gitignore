@@ -222,3 +222,6 @@ data/
 mlruns/
 mlartifacts/
 .DS_Store
+
+# Experiments: ad-hoc runs
+experiments/results/manual/

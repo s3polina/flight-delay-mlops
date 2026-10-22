@@ -1,23 +1,23 @@
-import asyncio
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from importlib.metadata import version
 from time import perf_counter
+from typing import Annotated
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import asyncpg
-import pandas as pd
-from fastapi import FastAPI, HTTPException, Request
+from aio_pika.exceptions import AMQPError
+from fastapi import FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse, Response
+from faststream.rabbit import RabbitBroker
 
+from flight_delay_mlops.config import settings
 from flight_delay_mlops.database import check_database
-from flight_delay_mlops.model import DELAY_THRESHOLD, LoadedModel, load_model
-from flight_delay_mlops.schemas import (
-    ModelInfo,
-    Prediction,
-    ProcessRequest,
-    ProcessResponse,
-)
+from flight_delay_mlops.messaging import declare_topology, publish_task
+from flight_delay_mlops.schemas import Flight, TaskAccepted, TaskMessage, TaskStatus
+from flight_delay_mlops.storage import TaskStore
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("flight_delay_mlops")
@@ -25,37 +25,20 @@ logger = logging.getLogger("flight_delay_mlops")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Модель загружается из MLflow ОДИН раз при старте приложения."""
-    app.state.model = None
-    try:
-        # загрузка блокирующая (сеть + десериализация) -> в отдельном потоке
-        app.state.model = await asyncio.to_thread(load_model)
-    except Exception:
-        # приложение стартует, но /process отвечает 503, пока модель не загружена
-        logger.exception("failed to load model from MLflow")
+    broker = RabbitBroker(settings.rabbit_url)
+    await broker.connect()
+    await declare_topology(broker)
+    app.state.broker = broker
+    app.state.store = await TaskStore.connect(settings.database_url)
     yield
+    await app.state.store.close()
+    await broker.stop()
 
 
 app = FastAPI(
     title="Flight Delay MLOps",
     lifespan=lifespan,
 )
-
-
-def get_model(request: Request) -> LoadedModel:
-    model = getattr(request.app.state, "model", None)
-    if model is None:
-        raise HTTPException(status_code=503, detail="Model is not loaded")
-    return model
-
-
-def model_info(model: LoadedModel) -> ModelInfo:
-    return ModelInfo(
-        name=model.name,
-        alias=model.alias,
-        version=model.version,
-        run_id=model.run_id,
-    )
 
 
 @app.middleware("http")
@@ -115,30 +98,60 @@ async def health() -> dict[str, str | float] | JSONResponse:
         )
 
 
-@app.get("/api/v1/model")
-async def get_model_info(request: Request) -> ModelInfo:
-    """Какая версия модели сейчас обслуживает запросы."""
-    return model_info(get_model(request))
-
-
-@app.post("/process")
-async def process(payload: ProcessRequest, request: Request) -> ProcessResponse:
-    """Inference: вероятность задержки прилёта > 15 минут для каждого рейса."""
-    model = get_model(request)
-
-    df = pd.DataFrame([flight.model_dump() for flight in payload.flights])
-    df["flight_date"] = df["flight_date"].astype(str)
-
-    # predict - CPU-bound, не блокируем event loop
-    probabilities = await asyncio.to_thread(model.predict_proba, df)
-
-    return ProcessResponse(
-        model=model_info(model),
-        predictions=[
-            Prediction(
-                delay_probability=round(p, 4),
-                is_delayed=p >= DELAY_THRESHOLD,
-            )
-            for p in probabilities
-        ],
+def overloaded_response() -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={
+            "detail": "Service is overloaded: task queue is full. Retry later.",
+        },
+        headers={"Retry-After": str(settings.retry_after_sec)},
     )
+
+
+@app.post(
+    "/api/v1/tasks",
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=TaskAccepted,
+    responses={503: {"description": "Очередь заполнена, повторите после Retry-After"}},
+)
+async def create_task(
+    flight: Flight,
+    request: Request,
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+) -> TaskAccepted | JSONResponse:
+    task_id = (
+        uuid5(NAMESPACE_URL, f"api:{idempotency_key}") if idempotency_key else uuid4()
+    )
+    created_at = datetime.now(UTC)
+    task = TaskMessage(
+        task_id=task_id, source="api", created_at=created_at, flight=flight
+    )
+
+    broker: RabbitBroker = request.app.state.broker
+    store: TaskStore = request.app.state.store
+
+    try:
+        accepted, task_status = await store.create_pending(
+            task_id,
+            flight.model_dump(mode="json"),
+            created_at,
+            publish=lambda: publish_task(broker, task, timeout=2.0),
+        )
+    except (asyncpg.PostgresError, AMQPError, OSError, TimeoutError):
+        logger.exception("failed to enqueue task")
+        return overloaded_response()
+
+    if not accepted:
+        logger.warning("queue is full, task rejected (load shedding)")
+        return overloaded_response()
+
+    return TaskAccepted(task_id=task_id, status=task_status)
+
+
+@app.get("/api/v1/tasks/{task_id}")
+async def get_task(task_id: UUID, request: Request) -> TaskStatus:
+    store: TaskStore = request.app.state.store
+    row = await store.get(task_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return TaskStatus(**row)
