@@ -49,7 +49,7 @@ def main() -> None:
         while time.time() - started < args.duration:
             try:
                 row = snapshot(args.queue)
-            except Exception as exc:
+            except (OSError, ValueError, KeyError, IndexError) as exc:
                 print(f"monitor: {exc}")
                 time.sleep(1)
                 continue

@@ -4,8 +4,15 @@ from uuid import uuid4
 import numpy as np
 import pandas as pd
 import pytest
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider as SdkTracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+    InMemorySpanExporter,
+)
 
 from flight_delay_mlops.model import LoadedModel
+from flight_delay_mlops.telemetry import setup_telemetry
 
 FLIGHT = {
     "flight_date": "2013-12-20",
@@ -53,3 +60,20 @@ def make_task():
         return task
 
     return factory
+
+
+@pytest.fixture(scope="session")
+def span_exporter() -> InMemorySpanExporter:
+    setup_telemetry("flight-tests")
+    provider = trace.get_tracer_provider()
+    if not isinstance(provider, SdkTracerProvider):
+        pytest.skip("OpenTelemetry SDK is disabled")
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    return exporter
+
+
+@pytest.fixture
+def spans(span_exporter: InMemorySpanExporter) -> InMemorySpanExporter:
+    span_exporter.clear()
+    return span_exporter

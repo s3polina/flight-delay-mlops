@@ -46,11 +46,13 @@ def load_model(name: str = MODEL_NAME, alias: str = MODEL_ALIAS) -> LoadedModel:
     model = mlflow.pyfunc.load_model(f"models:/{name}/{model_version.version}")
 
     logger.info(
-        "model loaded name=%s alias=%s version=%s run_id=%s",
-        name,
-        alias,
-        model_version.version,
-        model_version.run_id,
+        "model loaded",
+        extra={
+            "model_name": name,
+            "model_alias": alias,
+            "model_version": str(model_version.version),
+            "model_run_id": model_version.run_id,
+        },
     )
     return LoadedModel(
         model=model,

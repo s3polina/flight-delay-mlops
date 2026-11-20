@@ -36,8 +36,12 @@ web = [
     "pandas>=2.2",
     "scikit-learn>=1.6",
     # брокер сообщений: API, источник задач и воркер
-    "faststream[rabbit]>=0.6,<0.7",
+    "faststream[rabbit,otel]>=0.6,<0.7",
     "psutil>=6.0",
+    "opentelemetry-sdk>=1.45",
+    "opentelemetry-exporter-otlp-proto-grpc>=1.45",
+    "opentelemetry-instrumentation-fastapi>=0.66b1",
+    "opentelemetry-instrumentation-asyncpg>=0.66b1",
 ]
 # EDA, обучение и регистрация моделей (скрипты из папки ml/)
 ml = [

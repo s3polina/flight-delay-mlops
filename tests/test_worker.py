@@ -1,15 +1,21 @@
 import asyncio
 import contextlib
+import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 
 import pytest
 from faststream.rabbit import TestRabbitBroker
+from opentelemetry.trace import StatusCode
 
 from flight_delay_mlops import worker
 from flight_delay_mlops.config import settings
+from flight_delay_mlops.logs import ContextFilter
+from flight_delay_mlops.messaging import publish_task
+from flight_delay_mlops.schemas import TaskMessage
 from flight_delay_mlops.storage import TaskResult
+from flight_delay_mlops.telemetry import inference_buckets
 
 
 class FakeStore:
@@ -120,3 +126,99 @@ async def test_inference_does_not_block_event_loop(
     assert elapsed >= 0.5
     assert ticks >= 5
     assert worker.health_payload()["processed"] == 1
+
+
+class ContextRecords(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__()
+        self.records: list[logging.LogRecord] = []
+        self.addFilter(ContextFilter("flight-worker"))
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+
+@pytest.fixture
+def context_records():
+    handler = ContextRecords()
+    root = logging.getLogger()
+    root.addHandler(handler)
+    yield handler.records
+    root.removeHandler(handler)
+
+
+def span_named(spans, suffix: str):
+    return next(s for s in spans.get_finished_spans() if s.name.endswith(suffix))
+
+
+@pytest.mark.asyncio
+async def test_inference_and_db_spans_belong_to_task_trace(
+    worker_state, make_task, spans
+) -> None:
+    async with TestRabbitBroker(worker.broker) as br:
+        await br.publish(make_task(), queue=settings.tasks_queue)
+
+    process = span_named(spans, " process")
+    inference = span_named(spans, "model.inference")
+    db = span_named(spans, "db.save_result")
+
+    assert inference.parent.span_id == process.context.span_id
+    assert db.parent.span_id == process.context.span_id
+    assert inference.context.trace_id == process.context.trace_id
+    assert inference.attributes["model.alias"] == "champion"
+    assert inference.attributes["model.version"] == "2"
+
+
+@pytest.mark.asyncio
+async def test_task_id_and_trace_id_are_added_to_handler_logs(
+    worker_state, make_task, context_records
+) -> None:
+    task = TaskMessage.model_validate(make_task())
+
+    async with TestRabbitBroker(worker.broker) as br:
+        assert await publish_task(br, task) is True
+
+    worker_logs = [r for r in context_records if r.name == "flight_delay_mlops.worker"]
+    assert worker_logs
+    assert {r.task_id for r in worker_logs} == {str(task.task_id)}
+    assert all(r.trace_id for r in worker_logs)
+
+
+@pytest.mark.asyncio
+async def test_last_failed_attempt_is_logged_and_traced_as_dlq(
+    worker_state, make_task, spans, caplog
+) -> None:
+    worker_state.store = FakeStore(fail=True)
+    limit = worker.settings.delivery_limit
+
+    async with TestRabbitBroker(worker.broker) as br:
+        with contextlib.suppress(ConnectionError):
+            await br.publish(
+                make_task(),
+                queue=settings.tasks_queue,
+                headers={"x-delivery-count": limit},
+            )
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert "task redelivered" in messages
+    assert "task processing failed" in messages
+    assert "task sent to DLQ: delivery limit reached" in messages
+    failed = next(
+        r for r in caplog.records if r.getMessage() == "task processing failed"
+    )
+    assert failed.exc_info is not None
+    assert failed.attempt == limit + 1
+
+    process = span_named(spans, " process")
+    assert process.status.status_code is StatusCode.ERROR
+    assert process.attributes["messaging.delivery.attempt"] == limit + 1
+    event_names = {e.name for e in process.events}
+    assert {"exception", "redelivery", "dead_lettered"} <= event_names
+
+
+def test_inference_buckets_surround_configured_delay() -> None:
+    buckets = inference_buckets(0.2)
+
+    assert buckets == sorted(buckets)
+    assert buckets[0] < 0.2 < buckets[-1]
+    assert sum(1 for b in buckets if 0.2 <= b <= 0.3) >= 3

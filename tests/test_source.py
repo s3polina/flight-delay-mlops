@@ -93,3 +93,31 @@ def test_read_tasks_is_lazy_and_deterministic(tmp_path) -> None:
     again = next(source.read_tasks(csv_path, "run1"))
     assert first.task_id == again.task_id
     assert len(list(tasks)) == 1
+
+
+@pytest.mark.asyncio
+async def test_each_task_has_own_trace_with_wait_spans(
+    monkeypatch: pytest.MonkeyPatch, spans
+) -> None:
+    answers = iter([False, True, True])
+
+    async def fake_publish(broker, t, cfg=settings, timeout=None) -> bool:
+        return next(answers)
+
+    monkeypatch.setattr(source, "publish_task", fake_publish)
+    stats = source.SourceStats()
+
+    assert await source.publish_with_backoff(None, task(), stats, asyncio.Event(), FAST)
+    assert await source.publish_with_backoff(None, task(), stats, asyncio.Event(), FAST)
+
+    finished = spans.get_finished_spans()
+    roots = [s for s in finished if s.name == "source.publish_task"]
+    waits = [s for s in finished if s.name == "source.wait_for_capacity"]
+
+    assert len(roots) == 2
+    assert all(r.parent is None for r in roots)
+    assert roots[0].context.trace_id != roots[1].context.trace_id
+    assert len(waits) == 1
+    assert waits[0].parent.span_id == roots[0].context.span_id
+    assert [e.name for e in roots[0].events] == ["broker.rejected"]
+    assert stats.wait_total_sec > 0

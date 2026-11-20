@@ -1449,3 +1449,209 @@ uv run python experiments/analyze.py unbounded_1w bounded_1w bounded_2w bounded_
 2. **С ограничениями очередь не выходит за лимит**: не больше 101 задачи в ожидании и по 4 у каждого воркера. Память всех процессов постоянна.
 3. **Источник сам подстраивается под воркеров**: 14,7 против 14,9 задач/с с одним воркером, 29,4 против 29,3 с двумя. Он получал отказы брокера и ждал. Частоту никто не настраивал.
 4. **Второй воркер вдвое ускоряет и обработку, и источник** без изменения кода: 15 → 29 задач/с. Время задачи падает с 5,9 до 3,1 с: очередь та же, ~90 задач, но разбирается вдвое быстрее.
+
+## Observability: инфраструктура (ДЗ 5)
+
+Конфигурация вынесена в `observability/`. Стек: Loki (логи), Tempo (трейсы), Prometheus (метрики), Grafana (единая витрина), Grafana Alloy (чтение Docker stdout) и OpenTelemetry Collector (OTLP с `memory_limiter` и `batch`). Для учебного стенда это легче, чем ELK. Данные хранятся два дня, изображения контейнеров закреплены по версиям. Сервисы приложения не имеют `depends_on` на наблюдаемость.
+
+```bash
+cp .env.example .env
+docker compose up -d                             # только приложение
+docker compose --profile logs up -d             # + Loki и Alloy
+docker compose --profile traces up -d           # + Tempo и Collector
+docker compose --profile metrics up -d          # + Prometheus и Collector
+docker compose --profile observability up -d    # весь стек + Grafana
+```
+
+Интерфейсы: Grafana `http://localhost:3000` (логин `admin`, пароль из `GRAFANA_ADMIN_PASSWORD`), RabbitMQ `http://localhost:15672`, API `http://localhost:8000`. Для повторной демонстрации с чистого стенда `docker compose --profile observability down -v`, затем `docker compose --profile observability up -d`. **Внимание:** `down -v` удаляет данные БД, RabbitMQ, MLflow и наблюдаемости — используйте только для учебного стенда.
+
+### Контракт с Python-инструментацией
+
+Python-сервисы должны отправлять OTLP gRPC на `http://otel-collector:4317` и писать JSON-логи в stdout, включая `level`, `task_id`, `trace_id`, `span_id` как поля JSON (не Loki labels). Имена сервисов: `flight-api`, `flight-source`, `flight-worker`. Для Prometheus согласованы следующие имена (без `task_id` в labels):
+
+| Метрика | Тип | Метки |
+| --- | --- | --- |
+| `api_requests_total` | Counter | `route`, `status_code` |
+| `api_request_duration_seconds` | Histogram | `route` |
+| `api_overloaded_responses_total` | Counter | нет |
+| `source_tasks_published_total` | Counter | нет |
+| `source_broker_rejections_total` | Counter | нет |
+| `source_backoff_wait_seconds_total` | Counter | нет |
+| `worker_tasks_processed_total` | Counter | `result` = `ok`/`duplicate`/`error`/`dlq` |
+| `worker_inference_duration_seconds` | Histogram | нет |
+| `worker_tasks_in_flight` | Gauge | нет |
+| `worker_redeliveries_total` | Counter | нет |
+| `process_memory_rss_bytes` | Gauge | нет |
+
+Метрики Python-инструментации отправляются по OTLP в Collector с интервалом `OTEL_METRIC_EXPORT_INTERVAL=5000`, а Prometheus забирает их из экспортёра `otel-collector:8889`. Для короткоживущего источника выбран push, чтобы метрики не терялись между опросами. RabbitMQ включён с плагином `rabbitmq_prometheus`; метрики очередей читаются с `/metrics/per-object` порта 15692. Память контейнеров собирает cAdvisor.
+
+Лимиты памяти сервисов наблюдаемости: Loki 256 MiB, Alloy 128 MiB, Tempo 256 MiB, Collector 128 MiB, Prometheus 256 MiB, Grafana 256 MiB, cAdvisor 128 MiB, всего **1408 MiB (1.375 GiB)**. Это бюджет ограничений, не фактическое использование. Фактический расход подтвердить командой `docker stats --no-stream` после запуска под нагрузкой.
+
+Панели и алерты в репозитории, Grafana не требует ручного создания. Линия очереди и алерт сейчас рассчитаны на `QUEUE_MAX_LENGTH=100`; при другом лимите следует обновить выражения и порог. Алерт по очереди использует `>90%` и `for: 1m`, чтобы не реагировать на кратковременные скачки; алерт DLQ — `>0` в течение 10 секунд. Система должна проходить проверку с остановленным Collector без влияния на обработку задач, но поведение зависит также от SDK в Python-коде.
+# 29. Наблюдаемость: логи, трейсы и метрики приложения (ДЗ 5)
+
+Конвейер из ДЗ 4 (источник → ограниченная очередь RabbitMQ → FastStream-воркер с моделью из MLflow → PostgreSQL) теперь наблюдаемый. Новых сервисов нет: изменён только Python-код API, источника и воркера. Сервисы ничего не знают о хранилищах. Логи пишутся в stdout, трейсы и метрики уходят по OTLP в OpenTelemetry Collector. Collector, Loki/Tempo/Prometheus, Grafana и `observability/compose.yaml` настраиваются отдельно.
+
+## Файлы
+
+| Файл | Что делает |
+|---|---|
+| `src/flight_delay_mlops/logs.py` | единая настройка JSON-логов: формат, `LOG_LEVEL`, `task_id` из contextvars, `trace_id`/`span_id` из OpenTelemetry, маскирование секретов |
+| `src/flight_delay_mlops/telemetry.py` | OpenTelemetry SDK: resource, TracerProvider, MeterProvider, OTLP-экспорт, инструментация asyncpg, бакеты гистограмм, память процесса |
+| `src/flight_delay_mlops/messaging.py` | брокер с `RabbitTelemetryMiddleware` (W3C `traceparent` в заголовках) и `TaskContextMiddleware` (`task_id` из заголовка в contextvar) |
+| `src/flight_delay_mlops/main.py` | инструментация FastAPI, метрики HTTP, 503 в логах, трейсах и метриках |
+| `src/flight_delay_mlops/worker.py` | спаны inference и записи в БД, номер попытки, DLQ, метрики воркера |
+| `src/flight_delay_mlops/source.py` | один трейс на задачу, спаны ожидания при переполнении очереди, метрики источника |
+| `tests/test_logs.py` и новые тесты в `test_worker.py`, `test_source.py`, `test_tasks_api.py` | проверяют формат логов, контекст, дерево спанов, DLQ и 503 |
+
+## Переменные окружения
+
+Все настройки берутся из окружения, адресов в коде нет.
+
+| Переменная | Пример | Зачем |
+|---|---|---|
+| `LOG_LEVEL` | `INFO` | уровень логов всех сервисов и библиотек |
+| `OTEL_SERVICE_NAME` | `flight-api`, `flight-worker`, `flight-source` | `service.name` в трейсах, метриках и логах. Если переменная не задана, берётся имя сервиса по умолчанию из кода |
+| `OTEL_RESOURCE_ATTRIBUTES` | `deployment.environment.name=dev,service.instance.id=worker-1` | остальные resource-атрибуты. Если `service.instance.id` не задан, берётся `HOSTNAME` контейнера, поэтому два воркера различаются сами |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://otel-collector:4317` | адрес Collector. **Если переменная не задана, экспорт выключен**: приложение работает как раньше, `trace_id` в логах остаётся |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | `grpc` | используется экспортёр `opentelemetry-exporter-otlp-proto-grpc` |
+| `OTEL_TRACES_SAMPLER` (+ `OTEL_TRACES_SAMPLER_ARG`) | `always_on` | семплер (см. ниже) |
+| `OTEL_METRIC_EXPORT_INTERVAL` | `5000` | период отправки метрик в мс (по умолчанию 60 000, для дашборда лучше 5–10 с) |
+| `OTEL_SDK_DISABLED` | `false` | `true` полностью выключает SDK, сервисы продолжают работать |
+
+Если Collector не запущен, сервисы не падают и не замедляются. `BatchSpanProcessor` и `PeriodicExportingMetricReader` отправляют данные в фоновом потоке, ошибка экспорта не попадает в обработку задач. В `depends_on` приложения сервисов наблюдаемости нет.
+
+## 1. Логирование
+
+**Выбор: стандартный `logging` и свой `JsonFormatter`, без structlog и python-json-logger.** Uvicorn, FastStream, aio-pika, asyncpg и MLflow пишут через стандартный `logging`. Поэтому один обработчик на корневом логгере сразу приводит к одному формату и логи приложения, и логи библиотек. Для этого не нужна ещё одна библиотека. В structlog пришлось бы отдельно настраивать мост для чужих логов, и это дало бы два пути форматирования. Formatter занимает около 40 строк, а поля, маскирование и контекст под нашим контролем.
+
+Настройка одна для всех сервисов: `setup_logging(...)` в `logs.py`. `print` и `logging.basicConfig` удалены. Обработчики Uvicorn и FastStream снимаются, их записи идут в тот же JSON в stdout. Предупреждения Python (`warnings`) тоже уходят в лог.
+
+Каждая запись содержит одинаковый набор полей:
+
+```json
+{"timestamp": "2026-11-20T18:28:40.636+00:00", "level": "ERROR", "service": "flight-worker",
+ "logger": "flight_delay_mlops.worker", "message": "task processing failed",
+ "task_id": "6f1c…", "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736", "span_id": "00f067aa0ba902b7",
+ "attempt": 4, "max_attempts": 4, "will_retry": false,
+ "error_type": "ConnectionError", "exception": "Traceback (most recent call last): …"}
+```
+
+- **`task_id`** передаётся через RabbitMQ в заголовке `task_id`. Он же записан в `message_id` и `correlation_id`. `TaskContextMiddleware` кладёт его в `ContextVar` на время обработки сообщения, и он автоматически попадает во все записи обработчика, включая записи из потока inference. В API и источнике он привязывается тем же `bind_task_id()`. Вручную в сообщения его никто не дописывает.
+- **`trace_id` и `span_id`** фильтр берёт из активного OpenTelemetry-спана при каждой записи.
+- **Секреты.** Логин и пароль в URL (`amqp://user:pass@…`, `postgresql://user:pass@…`) заменяются на `***:***` в тексте, в исключениях и в полях. Поля с именами `password`, `token`, `secret`, `authorization` маскируются целиком. Данные рейса в лог не пишутся. Для невалидного сообщения пишется только место и тип ошибки pydantic, без значения `input`.
+- **Health-check'и не засоряют INFO.** Запросы к `/healthz` и `/api/v1/health` пишутся на DEBUG. Access-лог Uvicorn выключен до WARNING, вместо него есть собственная запись `http request` с маршрутом, кодом и длительностью. Служебные записи FastStream (`Received`/`Processed`) тоже на DEBUG.
+
+Какие события пишутся и с каким уровнем:
+
+| Событие | Сервис | Уровень | `message` |
+|---|---|---|---|
+| загрузка модели (alias, фактическая версия, run_id) | worker | INFO | `model loaded`, затем `worker ready` |
+| отказ брокера при переполнении очереди, источник замедляется | source | WARNING (один раз при переходе в режим ожидания, дальше каждый отказ на DEBUG) | `task queue is full, broker rejected publish: source slows down` |
+| очередь освободилась | source | INFO | `queue has free space again, source back to full speed` |
+| ответ 503 | api | WARNING (переполнение) / ERROR со стектрейсом (брокер или БД недоступны) | `task queue is full, responding 503` / `failed to enqueue task, responding 503` |
+| ошибка обработки: стектрейс, номер попытки, будет ли повтор | worker | ERROR | `task processing failed` |
+| повторная доставка и номер попытки | worker | WARNING | `task redelivered` |
+| перевод в DLQ | worker | ERROR | `task sent to DLQ: delivery limit reached` / `invalid task message, sending to DLQ` |
+| начало и конец graceful shutdown | api, worker, source | INFO | `graceful shutdown started` / `graceful shutdown finished` |
+| источник упал | source | ERROR со стектрейсом | `source crashed` |
+
+**Лейблы в Loki — только `service`, `level`, `env`.** `task_id` и `trace_id` остаются полями JSON и фильтруются через `| json | task_id="…"`. Каждое уникальное сочетание лейблов в Loki — отдельный поток со своим индексом и чанками. При `task_id` в лейблах один прогон источника на 6000 задач создал бы 6000 потоков по одной-две строки. Индекс раздувается, чанки получаются крошечными, запросы замедляются, Loki упирается в лимит потоков. Лейблы нужны для выбора небольшого числа потоков, а поиск конкретной задачи — это фильтр по содержимому внутри них.
+
+## 2. Распределённая трассировка
+
+Инструментация — OpenTelemetry SDK:
+
+- FastAPI — `opentelemetry-instrumentation-fastapi` (health-check'и исключены);
+- PostgreSQL — `opentelemetry-instrumentation-asyncpg` (без значений параметров запросов);
+- FastStream/RabbitMQ — встроенная `RabbitTelemetryMiddleware`. При публикации она кладёт W3C `traceparent` в заголовки сообщения, а при приёме продолжает трейс из них.
+
+Один трейс на задачу:
+
+```
+POST /api/v1/tasks                      (flight-api, SERVER)
+├── INSERT tasks … (asyncpg)
+└── default.flight.tasks publish        (PRODUCER)
+    └── default.flight.tasks process    (flight-worker, CONSUMER; attempt, task.queue_wait_sec)
+        ├── model.inference             (model.name, model.alias, model.version)
+        └── db.save_result
+            └── INSERT … ON CONFLICT (asyncpg)
+```
+
+У источника корень трейса — `source.publish_task`. **Каждая задача начинает новый трейс** (`context=Context()`), поэтому пакет из 6000 задач — это 6000 небольших трейсов, а не один на тысячи спанов. При переполнении очереди внутри появляются события `broker.rejected` (номер попытки) и дочерние спаны `source.wait_for_capacity` с длительностью паузы.
+
+- **Inference в пуле потоков.** `loop.run_in_executor(executor, contextvars.copy_context().run, run_inference, …)` переносит в поток текущий контекст: и OpenTelemetry-спан, и `task_id`. Поэтому `model.inference` — дочерний спан `process`, а не корневой.
+- **Сколько задача ждала в очереди** видно по промежутку между `publish` и `process` и по атрибуту `task.queue_wait_sec`.
+- **Ошибки.** У спана `process` статус `ERROR`, исключение записано через `record_exception`, в атрибуте `messaging.delivery.attempt` — номер попытки (из заголовка `x-delivery-count` quorum-очереди). Повторы видны как событие `redelivery`. На последней попытке (`attempt = DELIVERY_LIMIT + 1`) или для невалидного сообщения добавляется событие `dead_lettered` с причиной. Повторная доставка несёт тот же `traceparent`, поэтому **все попытки «ядовитого» сообщения и перевод в DLQ находятся в одном трейсе**.
+- **Ответ 503** тоже даёт трейс: серверный спан со статусом `ERROR` и событием `task.rejected` (`reason=queue_full|enqueue_error`).
+
+**Семплирование** задаётся только через `OTEL_TRACES_SAMPLER`. В коде семплер не указан, SDK читает переменную сам.
+
+- **Стенд: `always_on`** (или `parentbased_always_on`). Нагрузка маленькая (десятки задач в секунду), а на защите нужно найти трейс любой задачи, в том числе одной конкретной ошибки. Если терять трейсы, задачу «X» может быть не найти.
+- **Прод при сотнях задач в секунду: `parentbased_traceidratio` с `OTEL_TRACES_SAMPLER_ARG=0.05`** (примерно 5 %). Решение принимается один раз в корне (API или источник) и передаётся дальше в `traceparent` (флаг sampled), поэтому трейс сохраняется целиком или не сохраняется совсем, без обрывков. Чтобы не терять редкие ошибки и DLQ, лучше дополнительно включить tail sampling в Collector (`tail_sampling`: оставлять 100 % трейсов со статусом ERROR и медленных, остальные — по вероятности). Связка с логами при этом сохраняется: `trace_id` пишется в лог даже у трейсов, которые не попали в выборку.
+
+## 3. Метрики приложения
+
+**Способ сбора — push по OTLP через Collector**, без `/metrics`. Источник — короткоживущий пакетный процесс: он может завершиться раньше, чем Prometheus в следующий раз придёт за `/metrics` (обычно раз в 15 с), и его последние счётчики потеряются. При push SDK сам отправляет метрики раз в `OTEL_METRIC_EXPORT_INTERVAL`, а при завершении (`shutdown_telemetry()`) — последнюю порцию. Заодно у всех трёх сигналов один путь (OTLP → Collector), и приложению не нужно открывать порт для метрик.
+
+Метрики созданы через OpenTelemetry. В Prometheus (через `prometheus`-экспортёр Collector) имена получат суффиксы единиц и `_total`:
+
+| Сервис | OTel-метрика | Тип | Имя в Prometheus | Лейблы |
+|---|---|---|---|---|
+| api | `api.requests` | counter | `api_requests_total` | `http_request_method`, `http_route` (шаблон маршрута, не путь), `http_response_status_code` |
+| api | `api.request.duration` | histogram, с | `api_request_duration_seconds_*` | те же |
+| api | `api.overloaded.responses` | counter | `api_overloaded_responses_total` | `reason` (`queue_full`, `enqueue_error`) |
+| source | `source.tasks.published` | counter | `source_tasks_published_total` | — |
+| source | `source.broker.rejections` | counter | `source_broker_rejections_total` | — |
+| source | `source.publish.errors` | counter | `source_publish_errors_total` | — |
+| source | `source.backoff.wait` | counter, с | `source_backoff_wait_seconds_total` | — |
+| worker | `worker.tasks.processed` | counter | `worker_tasks_processed_total` | `result` (`ok`, `duplicate`, `error`, `dlq`) |
+| worker | `worker.inference.duration` | histogram, с | `worker_inference_duration_seconds_*` | `model_version` |
+| worker | `worker.tasks.in_flight` | gauge (UpDownCounter) | `worker_tasks_in_flight` | — |
+| worker | `worker.redeliveries` | counter | `worker_redeliveries_total` | — |
+| все | `process.memory.rss` | gauge, байты | `process_memory_rss_bytes` | — |
+
+К каждой метрике добавляются resource-атрибуты `service.name` и `service.instance.id`. Чтобы они стали лейблами `job`/`instance` и можно было строить разбивку по воркерам, в экспортёре Collector нужен `resource_to_telemetry_conversion: enabled: true`. Другой вариант — join с `target_info`. `task_id`, `trace_id` и другие неограниченные значения в лейблы не попадают. Связь с конкретной задачей дают exemplars: гистограммы записываются внутри спана, и SDK прикладывает `trace_id` (для показа в Grafana нужен `enable_open_metrics: true` в prometheus-экспортёре Collector).
+
+**Бакеты.** У гистограммы inference границы считаются от `INFERENCE_DELAY_SEC` (множители `0.5, 0.8, 0.9, 1, 1.1, 1.25, 1.4, 1.6, 2, 3, 5, 10`). При 0,2 с это `0.1, 0.16, 0.18, 0.2, 0.22, 0.25, 0.28, 0.32, 0.4, 0.6, 1, 2`. Реальное время ≈ 0,2 с задержки плюс 20–60 мс predict, оно попадает в густую часть шкалы, и p50/p95/p99 считаются точно. Бакеты OTel по умолчанию (`0, 5, 10, 25 … 10000`) рассчитаны на миллисекунды: в секундах всё попало бы в первый бакет. У API время ответа не зависит от модели (INSERT и publish с подтверждением, при 503 — быстрый отказ), поэтому бакеты `5 мс … 5 с` с запасом до таймаута публикации в 2 с.
+
+**Оценка числа временных рядов** (произведение числа значений лейблов):
+
+| Метрика | Расчёт | Рядов |
+|---|---|---|
+| `api_requests_total` | 2 метода × 6 маршрутов × 6 кодов = 72 максимум, реально встречается ~12 сочетаний | ≤ 72 (~12) |
+| `api_request_duration_seconds` | ~12 сочетаний × (12 бакетов + `+Inf` + `_sum` + `_count` = 15) | ~180 |
+| `api_overloaded_responses_total` | 2 причины | 2 |
+| источник, 4 счётчика | 4 × 1 экземпляр | 4 |
+| `worker_tasks_processed_total` | 4 результата × 2 воркера | 8 |
+| `worker_inference_duration_seconds` | 15 × 1–2 версии модели × 2 воркера | 30–60 |
+| `worker_tasks_in_flight`, `worker_redeliveries_total` | 2 × 2 воркера | 4 |
+| `process_memory_rss_bytes` | 4 процесса | 4 |
+| **итого** | | **~240–330** |
+
+Если в лейбл попадёт `task_id`, только счётчик воркера даст 6000 × 4 = 24 000 рядов за один прогон, и число будет расти с каждым следующим. Поэтому такие идентификаторы — только в логах, атрибутах спанов и exemplars.
+
+Глубина очередей, unacked и память контейнеров берутся не из приложения, а из Prometheus-плагина RabbitMQ (порт 15692) и cAdvisor.
+
+Запросы PromQL для защиты (вывод из ДЗ 4: скорость источника = пропускной способности воркеров, второй воркер её удваивает):
+
+```promql
+sum(rate(source_tasks_published_total[1m]))                         # скорость источника
+sum(rate(worker_tasks_processed_total{result="ok"}[1m]))            # пропускная способность всех воркеров
+sum by (instance) (rate(worker_tasks_processed_total{result="ok"}[1m]))  # по каждому воркеру
+histogram_quantile(0.95, sum by (le) (rate(worker_inference_duration_seconds_bucket[5m])))
+histogram_quantile(0.95, sum by (le) (rate(api_request_duration_seconds_bucket{http_route="/api/v1/tasks"}[5m])))
+sum(rate(api_overloaded_responses_total[5m])) / sum(rate(api_requests_total{http_route="/api/v1/tasks"}[5m]))  # доля 503
+rate(source_backoff_wait_seconds_total[1m])                         # какую долю времени источник ждёт
+```
+
+## Как проверить
+
+```bash
+uv lock                      # в pyproject добавлены зависимости OpenTelemetry
+uv sync --all-groups
+uv run ruff check . && uv run ruff format --check .
+uv run pytest -m "not integration"
+```
+
+Без стека наблюдаемости `docker compose up -d` работает как раньше, в `docker compose logs worker` видны JSON-строки. Со стеком к сервисам добавляются переменные `OTEL_*` из таблицы выше.

@@ -12,52 +12,113 @@ from aio_pika.exceptions import AMQPError
 from fastapi import FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse, Response
 from faststream.rabbit import RabbitBroker
+from opentelemetry import trace
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry.metrics import NoOpMeterProvider
+from opentelemetry.trace import Status, StatusCode
+from starlette.routing import Match
 
 from flight_delay_mlops.config import settings
 from flight_delay_mlops.database import check_database
-from flight_delay_mlops.messaging import declare_topology, publish_task
+from flight_delay_mlops.logs import bind_task_id, setup_logging
+from flight_delay_mlops.messaging import declare_topology, make_broker, publish_task
 from flight_delay_mlops.schemas import Flight, TaskAccepted, TaskMessage, TaskStatus
 from flight_delay_mlops.storage import TaskStore
+from flight_delay_mlops.telemetry import (
+    API_DURATION_BUCKETS,
+    meter,
+    setup_telemetry,
+    shutdown_telemetry,
+)
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("flight_delay_mlops")
+SERVICE_NAME = "flight-api"
+HEALTH_PATHS = {"/healthz", "/api/v1/health"}
+
+setup_logging(SERVICE_NAME)
+setup_telemetry(SERVICE_NAME)
+logger = logging.getLogger("flight_delay_mlops.api")
+
+http_requests = meter.create_counter(
+    "api.requests",
+    unit="{request}",
+    description="HTTP requests by route, method and status code",
+)
+http_duration = meter.create_histogram(
+    "api.request.duration",
+    unit="s",
+    description="HTTP request duration",
+    explicit_bucket_boundaries_advisory=API_DURATION_BUCKETS,
+)
+overloaded_responses = meter.create_counter(
+    "api.overloaded.responses",
+    unit="{response}",
+    description="503 responses because the task queue is full or unavailable",
+)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    broker = RabbitBroker(settings.rabbit_url)
+    broker: RabbitBroker = make_broker()
     await broker.connect()
     await declare_topology(broker)
     app.state.broker = broker
     app.state.store = await TaskStore.connect(settings.database_url)
+    logger.info("api started", extra={"queue": settings.tasks_queue})
     yield
+    logger.info("graceful shutdown started")
     await app.state.store.close()
     await broker.stop()
+    logger.info("graceful shutdown finished")
+    shutdown_telemetry()
 
 
 app = FastAPI(
     title="Flight Delay MLOps",
     lifespan=lifespan,
 )
+FastAPIInstrumentor.instrument_app(
+    app,
+    excluded_urls="healthz,api/v1/health",
+    meter_provider=NoOpMeterProvider(),
+)
+
+
+def route_template(request: Request) -> str:
+    for route in request.app.router.routes:
+        match, _ = route.matches(request.scope)
+        if match is Match.FULL:
+            return getattr(route, "path", "unmatched")
+    return "unmatched"
 
 
 @app.middleware("http")
-async def log_requests(request: Request, call_next) -> Response:
+async def observe_requests(request: Request, call_next) -> Response:
     start_time = perf_counter()
-
-    response = await call_next(request)
-
-    response_time = (perf_counter() - start_time) * 1000
-
-    logger.info(
-        "request method=%s path=%s status_code=%s response_time_ms=%.2f",
-        request.method,
-        request.url.path,
-        response.status_code,
-        response_time,
-    )
-
-    return response
+    status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        return response
+    finally:
+        duration = perf_counter() - start_time
+        route = route_template(request)
+        attributes = {
+            "http.request.method": request.method,
+            "http.route": route,
+            "http.response.status_code": status_code,
+        }
+        http_requests.add(1, attributes)
+        http_duration.record(duration, attributes)
+        logger.log(
+            logging.DEBUG if request.url.path in HEALTH_PATHS else logging.INFO,
+            "http request",
+            extra={
+                "method": request.method,
+                "route": route,
+                "status_code": status_code,
+                "duration_ms": round(duration * 1000, 2),
+            },
+        )
 
 
 @app.get("/healthz")
@@ -87,6 +148,7 @@ async def health() -> dict[str, str | float] | JSONResponse:
         }
     except (asyncpg.PostgresError, OSError):
         response_time = (perf_counter() - start_time) * 1000
+        logger.warning("database health check failed", exc_info=True)
 
         return JSONResponse(
             status_code=503,
@@ -98,7 +160,11 @@ async def health() -> dict[str, str | float] | JSONResponse:
         )
 
 
-def overloaded_response() -> JSONResponse:
+def overloaded_response(reason: str) -> JSONResponse:
+    overloaded_responses.add(1, {"reason": reason})
+    span = trace.get_current_span()
+    span.add_event("task.rejected", {"reason": reason})
+    span.set_status(Status(StatusCode.ERROR, f"503: {reason}"))
     return JSONResponse(
         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         content={
@@ -130,28 +196,40 @@ async def create_task(
     broker: RabbitBroker = request.app.state.broker
     store: TaskStore = request.app.state.store
 
-    try:
-        accepted, task_status = await store.create_pending(
-            task_id,
-            flight.model_dump(mode="json"),
-            created_at,
-            publish=lambda: publish_task(broker, task, timeout=2.0),
-        )
-    except (asyncpg.PostgresError, AMQPError, OSError, TimeoutError):
-        logger.exception("failed to enqueue task")
-        return overloaded_response()
+    with bind_task_id(task_id):
+        span = trace.get_current_span()
+        span.set_attribute("task.id", str(task_id))
+        try:
+            accepted, task_status = await store.create_pending(
+                task_id,
+                flight.model_dump(mode="json"),
+                created_at,
+                publish=lambda: publish_task(broker, task, timeout=2.0),
+            )
+        except (asyncpg.PostgresError, AMQPError, OSError, TimeoutError) as exc:
+            span.record_exception(exc)
+            logger.exception(
+                "failed to enqueue task, responding 503",
+                extra={"status_code": 503, "retry_after_sec": settings.retry_after_sec},
+            )
+            return overloaded_response("enqueue_error")
 
-    if not accepted:
-        logger.warning("queue is full, task rejected (load shedding)")
-        return overloaded_response()
+        if not accepted:
+            logger.warning(
+                "task queue is full, responding 503",
+                extra={"status_code": 503, "retry_after_sec": settings.retry_after_sec},
+            )
+            return overloaded_response("queue_full")
 
-    return TaskAccepted(task_id=task_id, status=task_status)
+        logger.info("task accepted", extra={"task_status": task_status})
+        return TaskAccepted(task_id=task_id, status=task_status)
 
 
 @app.get("/api/v1/tasks/{task_id}")
 async def get_task(task_id: UUID, request: Request) -> TaskStatus:
     store: TaskStore = request.app.state.store
-    row = await store.get(task_id)
+    with bind_task_id(task_id):
+        row = await store.get(task_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Task not found")
     return TaskStatus(**row)

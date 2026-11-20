@@ -1,2 +1,4 @@
 def main() -> None:
-    print("Hello from flight-delay-mlops!")
+    from flight_delay_mlops.source import run
+
+    run()

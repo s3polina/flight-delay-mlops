@@ -2,6 +2,7 @@ from contextlib import asynccontextmanager
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from opentelemetry.trace import SpanKind, StatusCode
 
 from flight_delay_mlops import main
 from flight_delay_mlops.config import Settings, settings
@@ -146,3 +147,23 @@ async def test_invalid_flight_is_rejected(store: TaskStore) -> None:
 def test_retry_after_is_queue_drain_time() -> None:
     cfg = Settings(queue_max_length=100, inference_delay_sec=0.2, worker_concurrency=4)
     assert cfg.retry_after_sec == 5
+
+
+@pytest.mark.asyncio
+async def test_overload_503_is_visible_in_trace(
+    store: TaskStore, monkeypatch: pytest.MonkeyPatch, spans
+) -> None:
+    mock_broker(monkeypatch, accept=False)
+
+    response = await post_task()
+
+    assert response.status_code == 503
+    server = [
+        s
+        for s in spans.get_finished_spans()
+        if s.attributes.get("http.route") == "/api/v1/tasks"
+        and s.kind is SpanKind.SERVER
+    ]
+    assert server
+    assert server[0].status.status_code is StatusCode.ERROR
+    assert "task.rejected" in {e.name for e in server[0].events}
