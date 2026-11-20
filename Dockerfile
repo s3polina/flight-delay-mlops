@@ -2,7 +2,12 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+ENV OMP_NUM_THREADS=1 \
+    PYTHONUNBUFFERED=1
+
+RUN pip install --no-cache-dir "uv>=0.9"
+
+ENV UV_HTTP_TIMEOUT=300
 
 COPY pyproject.toml uv.lock README.md ./
 
@@ -12,7 +17,10 @@ COPY src ./src
 
 RUN uv sync --frozen --no-dev --group web
 
-RUN useradd --create-home appuser
+RUN chmod -R a+rX /app/src \
+    && useradd --create-home appuser \
+    && mkdir -p /app/experiments/results \
+    && chown -R appuser /app/experiments
 
 USER appuser
 
